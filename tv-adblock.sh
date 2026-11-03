@@ -13,6 +13,8 @@
 #   3. Private DNS (DNS_HOST=...): switch Android's Private DNS (DNS-over-TLS) to DNS_HOST. This is the
 #      step that makes network-wide DNS blocking stick: a TV that ignores the router's DNS setting
 #      (Google DNS hard-coded, IPv6 router advertisements) still has to use the resolver set here.
+#      It turns on automatic time first and checks the TV clock: with a wrong clock the certificate looks
+#      "not yet valid" or expired, every lookup fails, and the TV cannot even fetch the time to fix itself.
 #
 # What it does NOT do: it does not run the DNS server for you. DNS_HOST must already answer DNS-over-TLS on
 # port 853 with a certificate that is valid for that exact name (AdGuard Home does this once TLS is set up
@@ -141,6 +143,8 @@ say "TV: $BRAND $MODEL, Android $RELEASE (SDK ${SDK:-?}), $ABI"
 if [ "$CMD" = status ]; then
   say "Private DNS mode:      $(tv settings get global private_dns_mode)"
   say "Private DNS hostname:  $(tv settings get global private_dns_specifier)"
+  say "Automatic time:        $(tv settings get global auto_time)   (1 = on)"
+  say "TV clock:              $(tv date)   (this machine: $(date))"
   say "Disabled packages (all, not only ours):"
   tv pm list packages -d | sed 's/^package:/  /'
   [ -f "$UNDO_FILE" ] && say "Undo list: $UNDO_FILE" || say "No undo list for this TV in $STATE_DIR."
@@ -161,6 +165,10 @@ if [ "$CMD" = undo ]; then
         dns_spec)
           if [ "$a" = null ]; then mutate settings delete global private_dns_specifier >/dev/null
           else mutate settings put global private_dns_specifier "$a" >/dev/null; fi ;;
+        auto_time)
+          say "automatic time back to: $a"
+          if [ "$a" = null ]; then mutate settings delete global auto_time >/dev/null
+          else mutate settings put global auto_time "$a" >/dev/null; fi ;;
         smarttube) say "SmartTube ($a) was installed by this script; remove it yourself if you want: adb uninstall $a" ;;
       esac
     done < "$UNDO_FILE"
@@ -207,6 +215,7 @@ if [ "${#TO_DISABLE[@]}" -gt 0 ]; then say "  disable ${#TO_DISABLE[@]} packages
 else say "  debloat: nothing to do"; fi
 [ "$SMARTTUBE" = 1 ] && say "  install SmartTube (stable, $ABI) from github.com/yuliskov/SmartTube"
 [ "$DO_DNS" = 1 ] && say "  Private DNS -> $DNS_HOST (DNS-over-TLS)"
+[ "$DO_DNS" = 1 ] && say "  automatic time on, and the TV clock checked against this machine's first"
 [ "$DO_DNS" = 0 ] && [ -z "$DNS_HOST" ] && say "  Private DNS: skipped (DNS_HOST not set)"
 [ "$DRY_RUN" = 1 ] && say "  (dry run: nothing will be changed)"
 say "  undo list: $UNDO_FILE"
@@ -269,6 +278,27 @@ if [ "$SMARTTUBE" = 1 ]; then
 fi
 
 if [ "$DO_DNS" = 1 ]; then
+  # A TV whose clock is wrong rejects the DoT certificate (not valid yet, or expired) and then has no DNS at
+  # all, so it cannot even fetch the time to repair itself. Turn automatic time on while the current DNS
+  # still works, wait for the clock to agree with this machine's, and only then switch.
+  if [ "$(tv settings get global auto_time)" != 1 ]; then
+    recorded auto_time || record auto_time "$(tv settings get global auto_time)"
+    mutate settings put global auto_time 1 >/dev/null
+    say "Turned on automatic time."
+  fi
+  skew=0
+  if [ "$DRY_RUN" != 1 ]; then
+    for _ in $(seq 1 12); do
+      tv_now=$(tv date +%s | tr -dc '0-9')
+      skew=$(( $(date +%s) - ${tv_now:-0} )); skew=${skew#-}
+      [ "$skew" -le 300 ] && break
+      sleep 5
+    done
+  fi
+  if [ "$skew" -gt 300 ]; then
+    msg="the TV clock is about $(( skew / 3600 )) hours away from this machine's even with automatic time on (TV says: $(tv date))"
+    [ "$FORCE" = 1 ] && warn "$msg; FORCE=1, carrying on." || die "$msg. With a wrong clock the certificate check fails and the TV would lose DNS. Set the TV's date and time, then run again. Private DNS was not changed."
+  fi
   # Remember what was there before the first run, and never overwrite it on later runs.
   recorded dns_mode || record dns_mode "$(tv settings get global private_dns_mode)"
   recorded dns_spec || record dns_spec "$(tv settings get global private_dns_specifier)"
